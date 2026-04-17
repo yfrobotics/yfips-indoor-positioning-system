@@ -69,3 +69,25 @@ def test_emit_predictions_with_ema_yields_nothing():
     ema.update(1, 0.0, 0.0, 0.0, t=0.0)
     # EMA can't extrapolate, so even a missing id should produce no output.
     assert list(emit_predictions(ema, detected_ids=set(), t=0.5)) == []
+
+
+def test_ema_last_measurement_t_returns_update_time():
+    ema = EMATracker()
+    assert ema.last_measurement_t(1) is None
+    ema.update(1, 0.0, 0.0, 0.0, t=3.25)
+    assert ema.last_measurement_t(1) == 3.25
+    ema.update(1, 0.1, 0.1, 0.1, t=4.50)
+    assert ema.last_measurement_t(1) == 4.50
+
+
+def test_kalman_last_measurement_t_ignores_predict_only():
+    k = KalmanTracker(q_accel=0.05, r_pos=0.01, r_yaw=0.01, timeout_s=10.0)
+    assert k.last_measurement_t(7) is None
+    k.update(7, 0.0, 0.0, 0.0, t=1.0)
+    assert k.last_measurement_t(7) == 1.0
+    # predict_only advances the filter's internal clock but not the
+    # measurement timestamp.
+    k.predict_only(7, t=2.0)
+    assert k.last_measurement_t(7) == 1.0
+    k.update(7, 1.0, 0.0, 0.0, t=3.0)
+    assert k.last_measurement_t(7) == 3.0

@@ -37,3 +37,7 @@ class EMATracker:
     def predict_only(self, rid: int, t: float) -> None:
         # EMA has no velocity model; nothing to extrapolate.
         return None
+
+    def last_measurement_t(self, rid: int) -> float | None:
+        row = self.state.get(rid)
+        return None if row is None else row[4]
