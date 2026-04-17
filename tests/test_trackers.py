@@ -91,3 +91,25 @@ def test_kalman_last_measurement_t_ignores_predict_only():
     assert k.last_measurement_t(7) == 1.0
     k.update(7, 1.0, 0.0, 0.0, t=3.0)
     assert k.last_measurement_t(7) == 3.0
+
+
+def test_emit_predictions_skips_recently_updated_ids():
+    k = KalmanTracker(q_accel=0.05, r_pos=0.01, r_yaw=0.01, timeout_s=10.0)
+    # Warm the filter so predict_only would return a value.
+    k.update(1, 0.0, 0.0, 0.0, t=0.0)
+    k.update(1, 1.0, 0.0, 0.0, t=1.0)
+    # At t=1.02, last measurement is 20ms old — below min_age_s.
+    out = list(emit_predictions(k, detected_ids=set(), t=1.02, min_age_s=0.05))
+    assert out == []
+    # At t=1.10, measurement is 100ms old — above min_age_s.
+    out = list(emit_predictions(k, detected_ids=set(), t=1.10, min_age_s=0.05))
+    assert [row[0] for row in out] == [1]
+
+
+def test_emit_predictions_min_age_defaults_to_zero():
+    # Backwards-compatible call without min_age_s still works as before.
+    k = KalmanTracker(q_accel=0.05, r_pos=0.01, r_yaw=0.01, timeout_s=10.0)
+    k.update(1, 0.0, 0.0, 0.0, t=0.0)
+    k.update(1, 1.0, 0.0, 0.0, t=1.0)
+    out = list(emit_predictions(k, detected_ids=set(), t=1.5))
+    assert [row[0] for row in out] == [1]

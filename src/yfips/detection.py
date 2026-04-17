@@ -253,16 +253,25 @@ def yaw_from_forward(H: np.ndarray, center_px: tuple[float, float],
     return math.atan2(fw[1] - cw[1], fw[0] - cw[0])
 
 
-def emit_predictions(tracker: Any, detected_ids: set[int], t: float
+def emit_predictions(tracker: Any, detected_ids: set[int], t: float,
+                     min_age_s: float = 0.0
                      ) -> Iterator[tuple[int, float, float, float]]:
     """Yield (rid, x, y, yaw) for tracked ids absent this frame whose
     tracker can extrapolate. Trackers without a velocity model (EMA)
-    silently produce nothing."""
+    silently produce nothing.
+
+    min_age_s: skip ids whose last real measurement is newer than this
+    threshold. Used by the prediction timer to avoid emitting a
+    prediction immediately after a detection lands for the same id."""
     if tracker is None:
         return
     for rid in tracker.ids():
         if rid in detected_ids:
             continue
+        if min_age_s > 0.0:
+            last = tracker.last_measurement_t(rid)
+            if last is not None and (t - last) < min_age_s:
+                continue
         out = tracker.predict_only(rid, t)
         if out is None:
             continue
