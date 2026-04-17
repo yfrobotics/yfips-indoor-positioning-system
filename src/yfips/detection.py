@@ -5,6 +5,7 @@ import collections
 import json
 import math
 import os
+import queue
 import socket
 import threading
 import time
@@ -110,18 +111,6 @@ def open_camera(cam: dict[str, Any]) -> Any:
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cam["height"])
     cap.set(cv2.CAP_PROP_FPS, cam["fps"])
     return cap
-
-
-def camera_settings(cfg: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
-    """Resolve camera index/width/height/fps with CLI > config > default precedence."""
-    cam_cfg = cfg.get("camera", {}) or {}
-    return {
-        "index": args.camera_index if args.camera_index is not None
-                 else cam_cfg.get("index", DEFAULT_CAMERA["index"]),
-        "width": args.width or cam_cfg.get("width", DEFAULT_CAMERA["width"]),
-        "height": args.height or cam_cfg.get("height", DEFAULT_CAMERA["height"]),
-        "fps": args.fps or cam_cfg.get("fps", DEFAULT_CAMERA["fps"]),
-    }
 
 
 class Publisher:
@@ -278,24 +267,100 @@ def emit_predictions(tracker: Any, detected_ids: set[int], t: float,
         yield (rid, *out)
 
 
+def drain_detections(
+    q: queue.Queue,
+    tracker: Any,
+    tracker_lock: threading.Lock,
+    pub: Any,
+    ros_pub: Any,
+) -> set[int]:
+    """Drain all available Detection items from q, update the tracker
+    under tracker_lock, and publish. Returns the set of ids seen this
+    drain."""
+    seen: set[int] = set()
+    while True:
+        try:
+            det = q.get_nowait()
+        except queue.Empty:
+            return seen
+        with tracker_lock:
+            if tracker is not None:
+                x, y, yaw = tracker.update(det.rid, det.x, det.y, det.yaw, det.t)
+            else:
+                x, y, yaw = det.x, det.y, det.yaw
+        payload = {"id": det.rid, "x": x, "y": y, "yaw": yaw,
+                   "t": det.t, "camera": det.camera}
+        pub.send(payload)
+        ros_pub.send(payload)
+        seen.add(det.rid)
+
+
+def _prediction_timer_loop(
+    tracker: Any,
+    tracker_lock: threading.Lock,
+    pub: Any,
+    ros_pub: Any,
+    stop_event: threading.Event,
+    interval_s: float,
+) -> None:
+    while not stop_event.wait(interval_s):
+        now = time.time()
+        with tracker_lock:
+            preds = list(emit_predictions(
+                tracker, detected_ids=set(), t=now, min_age_s=interval_s,
+            ))
+        for rid, x, y, yaw in preds:
+            payload = {"id": rid, "x": x, "y": y, "yaw": yaw,
+                       "t": now, "predicted": True}
+            pub.send(payload)
+            ros_pub.send(payload)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["apriltag", "image"], default=None,
                         help="detection mode; overrides config.mode")
     parser.add_argument("--camera-index", type=int, default=None,
-                        help="camera index; overrides config.camera.index")
+                        help="camera index; single-camera configs only")
     parser.add_argument("--width", type=int, default=None,
-                        help="frame width; overrides config.camera.width")
+                        help="frame width; single-camera configs only")
     parser.add_argument("--height", type=int, default=None,
-                        help="frame height; overrides config.camera.height")
+                        help="frame height; single-camera configs only")
     parser.add_argument("--fps", type=int, default=None,
-                        help="capture fps; overrides config.camera.fps")
+                        help="capture fps; single-camera configs only")
     args = parser.parse_args()
 
     cfg = config.load()
+    try:
+        config.validate_cameras(cfg["cameras"])
+    except ValueError as e:
+        raise SystemExit(f"[yfips] invalid cameras config: {e}") from e
+
+    if len(cfg["cameras"]) > 1 and any(v is not None for v in (
+            args.camera_index, args.width, args.height, args.fps)):
+        raise SystemExit(
+            "[yfips] --camera-index/--width/--height/--fps are only "
+            "supported with a single camera in config.cameras[]; "
+            "edit config.json for multi-camera setups"
+        )
+
+    if len(cfg["cameras"]) == 1:
+        cam = cfg["cameras"][0]
+        if args.camera_index is not None:
+            cam["index"] = args.camera_index
+        if args.width is not None:
+            cam["width"] = args.width
+        if args.height is not None:
+            cam["height"] = args.height
+        if args.fps is not None:
+            cam["fps"] = args.fps
+
     mode = args.mode or cfg.get("mode", "apriltag")
-    cam = camera_settings(cfg, args)
-    print(f"[yfips] mode={mode} camera={cam}")
+    print(f"[yfips] mode={mode} cameras={[c['name'] for c in cfg['cameras']]}")
+
+    # Lazy import to avoid a circular dependency with camera_worker.py,
+    # which imports helpers from this module at import time.
+    from yfips.camera_worker import CameraWorker
 
     pub = Publisher(cfg["udp"])
     ros_pub = RosPublisher(cfg.get("ros", {}))
@@ -314,92 +379,66 @@ def main() -> None:
             alpha=float(tracker_cfg.get("alpha", 0.4)),
             timeout_s=float(tracker_cfg.get("timeout_s", 1.0)),
         )
-    clicker = CalibClicker(cfg)
-    detector = build_detector(mode, cfg)
+    prediction_interval_s = float(tracker_cfg.get("prediction_interval_s", 0.05))
 
-    undistort_maps = None
-    if cfg.get("undistort", True) and cfg.get("camera_matrix") and cfg.get("dist_coeffs"):
-        K = np.array(cfg["camera_matrix"], dtype=np.float32)
-        D = np.array(cfg["dist_coeffs"], dtype=np.float32)
-        size = (cam["width"], cam["height"])
-        new_K, _ = cv2.getOptimalNewCameraMatrix(K, D, size, alpha=0.0, newImgSize=size)
-        undistort_maps = cv2.initUndistortRectifyMap(K, D, None, new_K, size, cv2.CV_16SC2)
-        print("[yfips] live undistortion enabled")
+    stop_event = threading.Event()
+    tracker_lock = threading.Lock()
+    config_lock = threading.Lock()
+    det_queue: queue.Queue = queue.Queue(maxsize=1024)
+    undistort_enabled = bool(cfg.get("undistort", True))
 
-    cap = open_camera(cam)
-    grabber = FrameGrabber(cap).start()
+    workers: list[CameraWorker] = []
+    for cam_cfg in cfg["cameras"]:
+        detector = build_detector(mode, cfg)
+        w = CameraWorker(
+            cam_cfg=cam_cfg,
+            world_corners_m=cfg["world_corners_m"],
+            detector=detector,
+            out_queue=det_queue,
+            stop_event=stop_event,
+            config_lock=config_lock,
+            undistort_enabled=undistort_enabled,
+        )
+        if w.failed:
+            print(f"[yfips] {cam_cfg['name']} failed to open — skipping")
+            continue
+        workers.append(w)
 
-    cv2.namedWindow(WINDOW_NAME)
-    cv2.setMouseCallback(WINDOW_NAME, clicker)
+    if not workers:
+        raise SystemExit("[yfips] no cameras could be opened")
 
-    fps_meter = FpsMeter(window=30)
-    last_counter = 0
+    for w in workers:
+        w.start()
+        cv2.namedWindow(f"YFIPS:{w.name}")
+        cv2.setMouseCallback(f"YFIPS:{w.name}", w.clicker)
+
+    pred_thread = threading.Thread(
+        target=_prediction_timer_loop,
+        args=(tracker, tracker_lock, pub, ros_pub, stop_event,
+              prediction_interval_s),
+        daemon=True, name="prediction-timer",
+    )
+    if tracker is not None:
+        pred_thread.start()
+
     try:
-        while True:
-            frame, counter, misses = grabber.get_new(last_counter, timeout=0.5)
-            if misses >= CAPTURE_FAILURE_LIMIT:
-                print(f"[yfips] camera returned no frame for "
-                      f"{CAPTURE_FAILURE_LIMIT} consecutive reads — exiting")
+        while not stop_event.is_set():
+            if all(w.failed for w in workers):
+                print("[yfips] all cameras failed — exiting")
                 break
-            if frame is None:
-                continue
-            last_counter = counter
-            now = time.time()
-            fps = fps_meter.tick(now)
-            if undistort_maps is not None:
-                frame = cv2.remap(frame, undistort_maps[0], undistort_maps[1],
-                                  cv2.INTER_LINEAR)
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-            for p in clicker.points:
-                cv2.circle(frame, (int(p[0]), int(p[1])), 4, (255, 0, 0), -1)
-
-            detections = detector.detect(gray)
-            detected_ids = set()
-            for det in detections:
-                cx, cy = det["center"]
-                for cn in det["corners"]:
-                    cv2.circle(frame, (int(cn[0]), int(cn[1])), 3, (0, 0, 255), -1)
-                cv2.circle(frame, (int(cx), int(cy)), 4, (0, 255, 0), -1)
-                fx_, fy_ = det["forward"]
-                cv2.arrowedLine(frame, (int(cx), int(cy)), (int(fx_), int(fy_)),
-                                (0, 255, 255), 1, tipLength=0.3)
-
-                if clicker.H is not None:
-                    x_w, y_w = image_to_world(clicker.H, det["center"])
-                    yaw = yaw_from_forward(clicker.H, det["center"], det["forward"])
-                    if tracker is not None:
-                        x_w, y_w, yaw = tracker.update(det["id"], x_w, y_w, yaw, now)
-                    detected_ids.add(det["id"])
-                    label = f"id={det['id']} x={x_w:.2f} y={y_w:.2f} yaw={math.degrees(yaw):.0f}"
-                    cv2.putText(frame, label, (int(cx) + 6, int(cy)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-                    payload = {"id": det["id"], "x": x_w, "y": y_w,
-                               "yaw": yaw, "t": now}
-                    pub.send(payload)
-                    ros_pub.send(payload)
-                else:
-                    cv2.putText(frame, f"id={det['id']}", (int(cx) + 6, int(cy)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-
-            if clicker.H is not None:
-                for rid, x_w, y_w, yaw in emit_predictions(tracker, detected_ids, now):
-                    payload = {"id": rid, "x": x_w, "y": y_w,
-                               "yaw": yaw, "t": now, "predicted": True}
-                    pub.send(payload)
-                    ros_pub.send(payload)
-
-            cv2.putText(frame, f"{mode} | fps: {fps:.1f}",
-                        (0, cam["height"] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255))
-            if clicker.H is None:
-                cv2.putText(frame, "double-click 4 corners in world_corners_m order",
-                            (0, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255))
-
-            cv2.imshow(WINDOW_NAME, frame)
+            for w in workers:
+                frame = w.latest_drawn_frame()
+                if frame is not None:
+                    cv2.imshow(f"YFIPS:{w.name}", frame)
+            drain_detections(det_queue, tracker, tracker_lock, pub, ros_pub)
             if cv2.waitKey(1) & 0xFF == 27:
                 break
     finally:
-        grabber.stop()
+        stop_event.set()
+        for w in workers:
+            w.stop()
+        if tracker is not None:
+            pred_thread.join(timeout=1.0)
         cv2.destroyAllWindows()
         ros_pub.shutdown()
 
