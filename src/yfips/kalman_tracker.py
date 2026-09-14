@@ -22,6 +22,7 @@ class _Filter:
         self.x = np.array([x, y, yaw, 0.0, 0.0, 0.0])
         self.P = np.diag([0.1, 0.1, 0.1, 1.0, 1.0, 1.0])
         self.t = t
+        self.last_measurement_t = t
         self.q_accel = q_accel
         self.H = np.zeros((3, 6))
         self.H[0, 0] = self.H[1, 1] = self.H[2, 2] = 1.0
@@ -76,10 +77,15 @@ class KalmanTracker:
         else:
             f.predict(t)
             f.update(x, y, yaw)
+            f.last_measurement_t = t
         return float(f.x[0]), float(f.x[1]), float(f.x[2])
 
     def ids(self) -> list[int]:
         return list(self.filters.keys())
+
+    def last_measurement_t(self, rid: int) -> float | None:
+        f = self.filters.get(rid)
+        return None if f is None else f.last_measurement_t
 
     def predict_only(self, rid: int, t: float) -> tuple[float, float, float] | None:
         """Advance a tracked id's state to time t without ingesting a measurement.

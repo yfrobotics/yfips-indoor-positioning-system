@@ -1,40 +1,43 @@
 """Tests for the pure-logic helpers in yfips.calibration."""
 
-from yfips.calibration import apply_intrinsics
+import pytest
+
+from yfips.calibration import apply_intrinsics_to_camera, images_glob_for_camera
 
 
-def test_apply_intrinsics_writes_matrix_and_dist():
-    cfg = {"camera_matrix": None, "dist_coeffs": None}
-    out = apply_intrinsics(cfg, mtx=[[1, 0, 0], [0, 1, 0], [0, 0, 1]],
-                           dist=[0.1, 0.0, 0.0, 0.0, 0.0])
-    assert out["camera_matrix"] == [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
-    assert out["dist_coeffs"] == [0.1, 0.0, 0.0, 0.0, 0.0]
-
-
-def test_apply_intrinsics_clears_stale_image_corners():
-    # Existing image_corners_px were clicked under the previous
-    # intrinsics; after recalibration they no longer match the
-    # rectified image. Drop them so the user re-clicks.
+def test_apply_intrinsics_to_camera_writes_into_matching_entry():
     cfg = {
-        "camera_matrix": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
-        "dist_coeffs": [0.0, 0.0, 0.0, 0.0, 0.0],
-        "image_corners_px": [[10, 20], [30, 40], [50, 60], [70, 80]],
+        "cameras": [
+            {"name": "cam0", "index": 0, "width": 640, "height": 480, "fps": 60,
+             "camera_matrix": None, "dist_coeffs": None,
+             "image_corners_px": None},
+            {"name": "cam1", "index": 2, "width": 640, "height": 480, "fps": 60,
+             "camera_matrix": None, "dist_coeffs": None,
+             "image_corners_px": [[1, 2], [3, 4], [5, 6], [7, 8]]},
+        ],
     }
-    out = apply_intrinsics(cfg, mtx=[[2, 0, 0], [0, 2, 0], [0, 0, 1]],
-                           dist=[0.5, 0.0, 0.0, 0.0, 0.0])
-    assert out["image_corners_px"] is None
+    out = apply_intrinsics_to_camera(
+        cfg, name="cam1",
+        mtx=[[2, 0, 0], [0, 2, 0], [0, 0, 1]],
+        dist=[0.5, 0.0, 0.0, 0.0, 0.0],
+    )
+    assert out["cameras"][1]["camera_matrix"] == [[2, 0, 0], [0, 2, 0], [0, 0, 1]]
+    assert out["cameras"][1]["dist_coeffs"] == [0.5, 0.0, 0.0, 0.0, 0.0]
+    # Only cam1's corners are cleared.
+    assert out["cameras"][1]["image_corners_px"] is None
+    # cam0 is untouched.
+    assert out["cameras"][0]["camera_matrix"] is None
 
 
-def test_apply_intrinsics_preserves_other_keys():
-    cfg = {"world_corners_m": [[0, 0], [5, 5]], "udp": {"port": 9999}}
-    out = apply_intrinsics(cfg, mtx=[[1, 0, 0], [0, 1, 0], [0, 0, 1]],
-                           dist=[0.0])
-    assert out["world_corners_m"] == [[0, 0], [5, 5]]
-    assert out["udp"] == {"port": 9999}
+def test_apply_intrinsics_to_camera_raises_on_unknown_name():
+    cfg = {"cameras": [{"name": "cam0", "index": 0, "width": 640, "height": 480,
+                        "fps": 60, "camera_matrix": None, "dist_coeffs": None,
+                        "image_corners_px": None}]}
+    with pytest.raises(ValueError, match="no camera named"):
+        apply_intrinsics_to_camera(cfg, name="nope", mtx=[[1, 0, 0]],
+                                   dist=[0.0])
 
 
-def test_apply_intrinsics_returns_same_dict_object():
-    # In-place update is fine — calibration.main() owns the dict.
-    cfg = {}
-    out = apply_intrinsics(cfg, mtx=[[1, 0, 0]], dist=[0.0])
-    assert out is cfg
+def test_images_glob_for_camera_uses_camera_subdir():
+    g = images_glob_for_camera("cam1")
+    assert g.endswith("/images/cam1/calibration_*.jpg")

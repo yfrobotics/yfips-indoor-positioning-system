@@ -12,7 +12,7 @@ Package management uses [uv](https://docs.astral.sh/uv/). Dependencies live in `
 
 ```bash
 uv sync                                               # create .venv + install deps
-uv run python -m yfips.calibration                    # chessboard calibration → config.json
+uv run python -m yfips.calibration --camera cam0      # calibrate a camera (default: first in cameras[])
 uv run python -m yfips.detection --mode apriltag      # default mode
 uv run python -m yfips.detection --mode image         # reference-image mode
 uv run pytest                                         # unit tests
@@ -27,19 +27,35 @@ Inside the window: double-click 4 world corners in the order of `world_corners_m
 
 All state flows through `config.json` (at repo root). Source lives under `src/yfips/` as an installable package — run modules with `python -m yfips.<name>`.
 
-- `src/yfips/config.py` — load/save `config.json`. Holds camera intrinsics, distortion, world/image corners, UDP settings, mode, references dir.
-- `src/yfips/calibration.py` — OpenCV chessboard calibration. Reads `images/calibration_*.jpg` (absolute-path glob; CWD-independent). Writes `camera_matrix` + `dist_coeffs` into `config.json`.
-- `src/yfips/detection.py` — main realtime loop.
-  - Builds a detector based on `mode` (`apriltag` uses the `apriltag` lib; `image` uses `ImageRefDetector`).
-  - If intrinsics are present and `undistort=true`, precomputes rectify maps (`cv2.initUndistortRectifyMap`) and remaps every frame.
-  - Mouse double-click collects 4 world-corner pixels → `cv2.findHomography` → image→world homography, persisted.
-  - Per detection: center + a "forward" image point are mapped through the homography; yaw = `atan2` of the world-frame forward vector. Smoothed by `EMATracker` per id before publish.
-  - Publishes `{id, x, y, yaw, t}` JSON over UDP (default `127.0.0.1:9999`) and optionally as a ROS 2 string topic.
+- `src/yfips/config.py` — load/save `config.json`. Holds a `cameras[]` array (each entry: `name`, `index`, `width`, `height`, `fps`, `camera_matrix`, `dist_coeffs`, `image_corners_px`), plus global `world_corners_m`, `udp`, `tracker`, `mode`, `references_dir`, `image_mode`, `apriltag_mode`, `undistort`, `ros`. Legacy flat single-camera configs are auto-migrated into `cameras=[{name:"cam0",...}]` on first load.
+- `src/yfips/calibration.py` — takes `--camera <name>`; reads `images/<name>/calibration_*.jpg` and writes intrinsics into the matching `cameras[]` entry. Only that camera's `image_corners_px` is cleared.
+- `src/yfips/camera_worker.py` — `CameraWorker` thread per camera: owns its own `VideoCapture`, `FrameGrabber`, undistort maps, detector, homography (`_PerCameraClicker`), and preview window `YFIPS:<name>`. Emits `Detection(rid, x, y, yaw, t, camera)` items onto a shared queue with drop-oldest backpressure.
+- `src/yfips/detection.py` — orchestrator.
+  - Loads + validates config, spawns one `CameraWorker` per `cameras[]` entry.
+  - Main thread drains the shared detection queue, updates a shared tracker under a `tracker_lock`, and publishes `{id, x, y, yaw, t, camera}` to UDP + ROS.
+  - A daemon prediction-timer thread fires every `tracker.prediction_interval_s` (default 50 ms) and emits `{predicted:true}` payloads for ids whose last measurement is older than that interval (prevents spam right after a real detection).
+  - Still owns the shared detector builder (`build_detector`), homography helpers (`compute_homography`, `image_to_world`, `yaw_from_forward`), publisher (`Publisher`), frame grabber + fps meter (`FrameGrabber`, `FpsMeter`), and AprilTag adapter.
 - `src/yfips/image_detector.py` — `ImageRefDetector`: ORB + BFMatcher/FLANN + RANSAC homography. Loads references from `references/<id>.{png,jpg}` where the filename stem is the integer robot id. Emits the same `{id, center, forward, corners}` shape as the AprilTag adapter so downstream world-transform code is shared. Set `image_mode.use_flann=true` for LSH-based matching at scale.
-- `src/yfips/tracker.py` — `EMATracker`: per-id exponential-moving-average smoothing of `(x, y, yaw)`; yaw smoothed via unit vector to handle wrap-around. Disable via `tracker.enabled=false`.
+- `src/yfips/tracker.py` / `kalman_tracker.py` — per-id smoothers. Tracker-level fusion happens implicitly: same-id detections from different cameras land in the same `tracker.update()` call keyed on `rid`. Both expose `last_measurement_t(rid)` for the prediction cooldown.
 - `src/yfips/ros_publisher.py` — optional ROS 2 publisher (std_msgs/String JSON). No-ops if `rclpy` isn't installed. Enable via `ros.enabled=true`.
-- `src/yfips/gui.py` — matplotlib live visualizer; listens to the UDP stream and plots each tracked robot as an arrow on the world plane. Run in a second terminal: `uv run python -m yfips.gui`.
-- `tests/` — pytest unit tests over pure-logic modules (trackers, homography, guards).
+- `src/yfips/gui.py` — matplotlib live visualizer; listens to the UDP stream and plots each tracked robot as an arrow on the world plane. Run in a second terminal: `uv run python -m yfips.gui`. Payloads now carry a `"camera"` field on detections (omitted on predicted packets).
+- `tests/` — pytest unit tests over pure-logic modules (trackers, homography, guards, config migration, camera worker, fusion, orchestrator).
+
+## Multi-camera runbook
+
+To add a second camera:
+
+1. Append an entry to `config.json`'s `cameras[]`:
+   ```json
+   {"name": "cam1", "index": 2, "width": 640, "height": 480, "fps": 60,
+    "camera_matrix": null, "dist_coeffs": null, "image_corners_px": null}
+   ```
+2. Drop chessboard images into `images/cam1/calibration_*.jpg`.
+3. `uv run python -m yfips.calibration --camera cam1`.
+4. Start detection. A `YFIPS:cam1` window opens; double-click 4 world corners in that window.
+5. Verify via the UDP listener: payloads should appear with `"camera": "cam1"`.
+
+CLI flags `--camera-index/--width/--height/--fps` are only honoured with a single camera in `cameras[]`; with N>1, edit `config.json` instead.
 
 UDP listener (debug):
 ```bash
@@ -50,9 +66,12 @@ while True: print(s.recvfrom(4096)[0].decode())"
 ## Gotchas
 
 - `apriltag` package name on PyPI varies by platform (swatbotics binding).
-- Running `yfips.calibration` auto-clears any previously-saved `image_corners_px`, because the old pixel coordinates refer to an image rectified with the old intrinsics. Re-click the 4 world corners after calibration.
-- Camera index, resolution and fps default to 0 / 640×480 / 60 fps but live in `config.json`'s `camera` block; CLI flags `--camera-index --width --height --fps` override at runtime.
+- Running `yfips.calibration --camera <name>` auto-clears that camera's saved `image_corners_px`, because the old pixel coordinates refer to an image rectified with the old intrinsics. Re-click the 4 world corners after calibration.
+- Camera index, resolution and fps live per-entry in `config.json`'s `cameras[]`; CLI flags `--camera-index --width --height --fps` override at runtime **only** when there's a single camera in `cameras[]`.
 - Image mode cost scales linearly with number of references; for ≳50 robots swap BFMatcher for FLANN.
 - World positioning assumes robots move on a **plane**; tall tags/robots get parallax error even after undistortion.
 - `ros` mode requires a ROS 2 install (Humble+) with `rclpy` on PYTHONPATH; otherwise it no-ops with a warning.
-- Toggling `undistort` after clicking world corners still misaligns them — only a recalibration auto-invalidates them. If you flip `undistort` manually, re-click.
+- Toggling `undistort` after clicking world corners still misaligns them — only a recalibration auto-invalidates them. If you flip `undistort` manually, re-click every camera's corners.
+- Duplicate `name` or `index` in `cameras[]` is a config error; startup fails with a clear message.
+- `cv2.imshow` / `waitKey` must run on the main thread. Workers only draw into a frame buffer; the orchestrator calls `imshow` and `waitKey` for every worker's latest frame once per main-loop tick.
+- Per-camera detector instances are a requirement, not a convenience: the AprilTag and ORB detectors are not safe to share across threads.
