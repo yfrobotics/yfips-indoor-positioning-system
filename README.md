@@ -19,7 +19,7 @@ Two planned variants exist: vision-based and ToF/tag-based, usable together or s
 
 ## 3. Hardware
 - **PC** (desktop or laptop) to run the program.
-- **Webcam** — an HD (1080p) camera is recommended. A Logitech C920/C922 gives a good quality/cost tradeoff.
+- **Camera** — a USB webcam or an IP camera with an RTSP stream. Multiple cameras can run together; configure each input in `config.json` under `cameras`.
 - **AprilTag printouts** — for AprilTag mode.
 - **Reference images** — for image mode (top-down crops of each robot, one file per id).
 - Wireless anchors/tags — TBD (ToF variant not yet implemented).
@@ -36,6 +36,44 @@ uv run python -m yfips.detection --mode apriltag   # or --mode image
 
 Mode can also be set permanently via `"mode": "apriltag" | "image"` in `config.json`.
 
+### RTSP cameras
+
+For a single-camera configuration, override the input with:
+
+```bash
+uv run python -m yfips.detection --camera-url 'rtsp://user:password@192.168.1.100:554/stream1'
+```
+
+For persistent or mixed webcam/IP-camera setups, add `rtsp_url` to each
+network camera entry in `config.json`:
+
+```json
+{
+  "name": "overhead",
+  "rtsp_url": "rtsp://192.168.1.100:554/stream1",
+  "width": 1920,
+  "height": 1080,
+  "fps": 30,
+  "camera_matrix": null,
+  "dist_coeffs": null,
+  "image_corners_px": null
+}
+```
+
+Place this entry in the `cameras` array. Each camera needs a unique name and
+input. `rtsp_url` takes precedence over `index`; local webcams continue to use
+`index`. `--camera-index` switches a single-camera setup back to a webcam.
+`--camera-url` and `--camera-index` are mutually exclusive. All camera CLI
+overrides (`--camera-url`, `--camera-index`, `--width`, `--height`, `--fps`)
+require exactly one configured camera; edit `cameras` for multi-camera setups.
+
+Configure stream resolution and FPS on the IP camera. YF-IPS does not change
+these stream settings; set `width` and `height` to the stream's actual size
+for lens undistortion, and calibrate using images from that same stream.
+RTSP decoding uses the installed OpenCV video backend. If opening fails,
+check the camera's stream URL, credentials, network reachability and backend
+support. Failed cameras are skipped so other inputs can continue.
+
 ### UDP output
 Detections are published as JSON datagrams `{"id", "x", "y", "yaw", "t"}` to `127.0.0.1:9999` by default (configurable under `udp` in `config.json`). Quick listener:
 
@@ -47,10 +85,22 @@ while True: print(s.recvfrom(4096)[0].decode())"
 ## 5. Calibration
 
 ### 5.1 Camera calibration
-Capture ~15 images of a 7×6-inner-corner chessboard and save them as `images/calibration_*.jpg`. Run `uv run python -m yfips.calibration` — it writes the camera matrix and distortion coefficients into `config.json`.
+For each camera, capture ~15 images of a 7×6-inner-corner chessboard at the
+resolution used for detection. Save them as
+`images/<camera_name>/calibration_*.jpg`, using the camera's configured `name`.
+For the RTSP example above:
+
+```bash
+uv run python -m yfips.calibration --camera overhead
+```
+
+Without `--camera`, calibration uses the first configured camera. It writes
+the camera matrix and distortion coefficients to that camera's entry in
+`config.json` and clears its saved world-corner calibration. Re-select those
+corners in the detection preview after recalibrating.
 
 ### 5.2 Environment calibration
-Run `uv run python -m yfips.detection` and **double-click the 4 world corners** of your playing area inside the video window, in the same order as `world_corners_m` in `config.json` (default: `(0,0), (5,0), (5,5), (0,5)` metres). The image→world homography is computed and persisted; subsequent runs reuse it. A 5th click resets and re-captures.
+Run `uv run python -m yfips.detection` and **double-click the 4 world corners** of your playing area inside each camera's video window, in the same order as `world_corners_m` in `config.json` (default: `(0,0), (5,0), (5,5), (0,5)` metres). The image→world homography is computed and persisted; subsequent runs reuse it. A 5th click resets and re-captures.
 
 ## 6. Detection modes
 

@@ -4,6 +4,7 @@ import copy
 import json
 import os
 from typing import Any
+from urllib.parse import urlsplit
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CONFIG_PATH = os.path.join(_REPO_ROOT, "config.json")
@@ -48,11 +49,31 @@ def migrate_cameras(cfg: dict[str, Any]) -> dict[str, Any]:
     entry["width"] = cam_block.get("width", entry["width"])
     entry["height"] = cam_block.get("height", entry["height"])
     entry["fps"] = cam_block.get("fps", entry["fps"])
+    if "rtsp_url" in cam_block:
+        entry["rtsp_url"] = cam_block["rtsp_url"]
     for k in ("camera_matrix", "dist_coeffs", "image_corners_px"):
         if k in out:
             entry[k] = out.pop(k)
     out["cameras"] = [entry]
     return out
+
+
+def camera_source(cam: dict[str, Any]) -> int | str:
+    """Resolve an RTSP URL (when supplied) or a local device index."""
+    url = cam.get("rtsp_url")
+    if url is not None:
+        try:
+            valid = isinstance(url, str) and urlsplit(url).scheme.lower() == "rtsp"
+            valid = valid and bool(urlsplit(url).hostname) and not any(c.isspace() for c in url)
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError("camera rtsp_url must be an rtsp:// URL with a hostname")
+        return url
+    index = cam.get("index")
+    if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+        raise ValueError("camera index must be a non-negative integer")
+    return index
 
 
 def validate_cameras(cameras: list[dict[str, Any]]) -> None:
@@ -61,10 +82,12 @@ def validate_cameras(cameras: list[dict[str, Any]]) -> None:
     names, indices = set(), set()
     for cam in cameras:
         name = cam["name"]
-        idx = cam["index"]
+        idx = camera_source(cam)
         if name in names:
             raise ValueError(f"duplicate camera name: {name!r}")
         if idx in indices:
+            if isinstance(idx, str):
+                raise ValueError("duplicate camera RTSP URL")
             raise ValueError(f"duplicate camera index: {idx}")
         names.add(name)
         indices.add(idx)
@@ -76,8 +99,8 @@ def load() -> dict[str, Any]:
     with open(CONFIG_PATH) as f:
         raw = json.load(f)
     merged = copy.deepcopy(DEFAULTS)
-    merged.update(raw)
-    migrated = migrate_cameras(merged)
+    merged.update(migrate_cameras(raw))
+    migrated = merged
     tracker_defaults = dict(DEFAULTS["tracker"])
     tracker_defaults.update(migrated.get("tracker") or {})
     migrated["tracker"] = tracker_defaults

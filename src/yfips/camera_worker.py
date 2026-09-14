@@ -19,6 +19,7 @@ import cv2
 import numpy as np
 
 from yfips import config
+from yfips.capture import create_capture
 from yfips.detection import (
     CAPTURE_FAILURE_LIMIT,
     FrameGrabber,
@@ -75,13 +76,10 @@ class CameraWorker:
         self._latest_lock = threading.Lock()
 
         if capture is None:
-            capture = cv2.VideoCapture(cam_cfg["index"])
+            capture = create_capture(cam_cfg)
             if not capture.isOpened():
+                capture.release()
                 self.failed = True
-            else:
-                capture.set(cv2.CAP_PROP_FRAME_WIDTH, cam_cfg["width"])
-                capture.set(cv2.CAP_PROP_FRAME_HEIGHT, cam_cfg["height"])
-                capture.set(cv2.CAP_PROP_FPS, cam_cfg["fps"])
         self.capture = capture
 
         self.undistort_maps = (

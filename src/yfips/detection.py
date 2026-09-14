@@ -101,15 +101,14 @@ class FpsMeter:
 def open_camera(cam: dict[str, Any]) -> Any:
     """Open a cv2.VideoCapture with the given settings dict.
     Raises SystemExit with a clear message if the device fails to open."""
-    cap = cv2.VideoCapture(cam["index"])
+    from yfips.capture import create_capture
+
+    cap = create_capture(cam)
     if not cap.isOpened():
-        raise SystemExit(
-            f"[yfips] failed to open camera at index {cam['index']} — "
-            "check the device, change config.camera.index, or pass --camera-index"
-        )
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, cam["width"])
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cam["height"])
-    cap.set(cv2.CAP_PROP_FPS, cam["fps"])
+        cap.release()
+        source = config.camera_source(cam)
+        label = "RTSP stream" if isinstance(source, str) else f"index {source}"
+        raise SystemExit(f"[yfips] failed to open camera at {label} — check config.cameras")
     return cap
 
 
@@ -320,7 +319,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["apriltag", "image"], default=None,
                         help="detection mode; overrides config.mode")
-    parser.add_argument("--camera-index", type=int, default=None,
+    source_args = parser.add_mutually_exclusive_group()
+    source_args.add_argument("--camera-url", default=None,
+                             help="RTSP URL; single-camera configs only")
+    source_args.add_argument("--camera-index", type=int, default=None,
                         help="camera index; single-camera configs only")
     parser.add_argument("--width", type=int, default=None,
                         help="frame width; single-camera configs only")
@@ -331,15 +333,10 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = config.load()
-    try:
-        config.validate_cameras(cfg["cameras"])
-    except ValueError as e:
-        raise SystemExit(f"[yfips] invalid cameras config: {e}") from e
-
     if len(cfg["cameras"]) > 1 and any(v is not None for v in (
-            args.camera_index, args.width, args.height, args.fps)):
+            args.camera_index, args.camera_url, args.width, args.height, args.fps)):
         raise SystemExit(
-            "[yfips] --camera-index/--width/--height/--fps are only "
+            "[yfips] --camera-index/--camera-url/--width/--height/--fps are only "
             "supported with a single camera in config.cameras[]; "
             "edit config.json for multi-camera setups"
         )
@@ -348,12 +345,20 @@ def main() -> None:
         cam = cfg["cameras"][0]
         if args.camera_index is not None:
             cam["index"] = args.camera_index
+            cam.pop("rtsp_url", None)
+        if args.camera_url is not None:
+            cam["rtsp_url"] = args.camera_url
         if args.width is not None:
             cam["width"] = args.width
         if args.height is not None:
             cam["height"] = args.height
         if args.fps is not None:
             cam["fps"] = args.fps
+
+    try:
+        config.validate_cameras(cfg["cameras"])
+    except ValueError as e:
+        raise SystemExit(f"[yfips] invalid cameras config: {e}") from e
 
     mode = args.mode or cfg.get("mode", "apriltag")
     print(f"[yfips] mode={mode} cameras={[c['name'] for c in cfg['cameras']]}")

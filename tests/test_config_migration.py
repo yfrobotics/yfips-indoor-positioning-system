@@ -97,3 +97,39 @@ def test_validate_cameras_accepts_valid():
         {"name": "cam1", "index": 2, "width": 640, "height": 480, "fps": 60,
          "camera_matrix": None, "dist_coeffs": None, "image_corners_px": None},
     ])
+
+
+def test_validate_mixed_sources_with_shared_unused_index():
+    validate_cameras([
+        {"name": "usb", "index": 0},
+        {"name": "ip1", "index": 0, "rtsp_url": "rtsp://192.0.2.1/live"},
+        {"name": "ip2", "rtsp_url": "rtsp://192.0.2.2/live"},
+    ])
+
+
+@pytest.mark.parametrize("url", ["", "http://camera/live", "rtsp:///live", 12])
+def test_validate_rejects_invalid_rtsp_url(url):
+    with pytest.raises(ValueError, match="rtsp_url"):
+        validate_cameras([{"name": "ip", "rtsp_url": url}])
+
+
+def test_duplicate_rtsp_source_does_not_expose_credentials():
+    url = "rtsp://user:secret@192.0.2.1/live"
+    with pytest.raises(ValueError, match="duplicate camera RTSP URL") as error:
+        validate_cameras([
+            {"name": "ip1", "rtsp_url": url}, {"name": "ip2", "rtsp_url": url},
+        ])
+    assert "secret" not in str(error.value)
+
+
+def test_load_migrates_legacy_rtsp_camera(tmp_path, monkeypatch):
+    import json
+
+    from yfips import config
+
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"camera": {"rtsp_url": "rtsp://192.0.2.1/live"}}))
+    monkeypatch.setattr(config, "CONFIG_PATH", str(path))
+    loaded = config.load()
+    assert loaded["cameras"][0]["rtsp_url"] == "rtsp://192.0.2.1/live"
+    assert config.load() == loaded

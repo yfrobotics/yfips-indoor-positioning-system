@@ -125,3 +125,28 @@ def test_worker_stop_joins_within_timeout():
     stop.set()
     worker.stop()
     assert not worker.thread.is_alive()
+
+
+def test_worker_opens_rtsp_and_processes_frames(monkeypatch):
+    from yfips import capture
+
+    fake = FakeCapture(np.zeros((480, 640, 3), dtype=np.uint8))
+    sources = []
+    def open_capture(source):
+        sources.append(source)
+        return fake
+    monkeypatch.setattr(capture.cv2, "VideoCapture", open_capture)
+    url = "rtsp://192.0.2.1/live"
+    q = queue.Queue()
+    worker = CameraWorker(
+        {"name": "ip", "rtsp_url": url,
+         "image_corners_px": [[0, 0], [640, 0], [640, 480], [0, 480]]},
+        [[0, 0], [640, 0], [640, 480], [0, 480]],
+        FakeDetector(), q, threading.Event(), threading.Lock(),
+    ).start()
+    try:
+        assert q.get(timeout=1).camera == "ip"
+    finally:
+        worker.stop()
+    assert sources == [url]
+    assert fake.released
