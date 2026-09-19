@@ -130,9 +130,10 @@ def test_worker_stop_joins_within_timeout():
 def test_worker_opens_rtsp_and_processes_frames(monkeypatch):
     from yfips import capture
 
+    monkeypatch.delenv("OPENCV_FFMPEG_CAPTURE_OPTIONS", raising=False)
     fake = FakeCapture(np.zeros((480, 640, 3), dtype=np.uint8))
     sources = []
-    def open_capture(source):
+    def open_capture(source, backend, params):
         sources.append(source)
         return fake
     monkeypatch.setattr(capture.cv2, "VideoCapture", open_capture)

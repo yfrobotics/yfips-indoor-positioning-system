@@ -70,7 +70,29 @@ require exactly one configured camera; edit `cameras` for multi-camera setups.
 Configure stream resolution and FPS on the IP camera. YF-IPS does not change
 these stream settings; set `width` and `height` to the stream's actual size
 for lens undistortion, and calibrate using images from that same stream.
-RTSP decoding uses the installed OpenCV video backend. If opening fails,
+RTSP capture prioritizes responsiveness: it explicitly uses OpenCV's FFmpeg
+backend with reduced startup buffering, low-delay decoding and one decoder
+thread. Capture runs continuously in the background and detection takes only
+the newest decoded frame, skipping intermediate frames when it falls behind.
+Connection attempts time out after 5 seconds and individual reads after 3
+seconds; these are failure timeouts, not a bound on end-to-end video delay.
+
+TCP is the default transport for compatibility. TCP retransmissions and
+camera-side encoding can still introduce delay. For a server and network that
+support UDP, you can favor packet loss over waiting for retransmission:
+
+```bash
+OPENCV_FFMPEG_CAPTURE_OPTIONS='rtsp_transport;udp|fflags;nobuffer|flags;low_delay|threads;1|max_delay;0|reorder_queue_size;0' \
+  uv run python -m yfips.detection
+```
+
+This example uses the RTSP URL saved in `config.json`; alternatively add
+`--camera-url`. UDP can produce damaged or missing frames. An explicit
+`OPENCV_FFMPEG_CAPTURE_OPTIONS` value replaces the defaults for all RTSP
+cameras in the process. See the [OpenCV options reference](https://docs.opencv.org/4.x/d6/dea/tutorial_env_reference.html)
+and [FFmpeg RTSP documentation](https://ffmpeg.org/ffmpeg-protocols.html#rtsp).
+
+If opening fails,
 check the camera's stream URL, credentials, network reachability and backend
 support. Failed cameras are skipped so other inputs can continue.
 

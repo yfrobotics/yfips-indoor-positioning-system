@@ -1,8 +1,15 @@
 """Tests for the camera-open error path."""
 
+import os
+
 import pytest
 
 from yfips import detection
+
+
+@pytest.fixture(autouse=True)
+def capture_environment(monkeypatch):
+    monkeypatch.delenv("OPENCV_FFMPEG_CAPTURE_OPTIONS", raising=False)
 
 
 class _FakeCap:
@@ -35,13 +42,25 @@ def test_open_camera_returns_cap_when_opened(monkeypatch):
     assert fake.props[detection.cv2.CAP_PROP_FRAME_WIDTH] == 1280
     assert fake.props[detection.cv2.CAP_PROP_FRAME_HEIGHT] == 720
     assert fake.props[detection.cv2.CAP_PROP_FPS] == 30
+    assert "OPENCV_FFMPEG_CAPTURE_OPTIONS" not in os.environ
 
 
 def test_open_rtsp_passes_url_without_device_properties(monkeypatch):
     fake = _FakeCap()
     sources = []
-    def open_capture(source):
+    def open_capture(source, backend, params):
         sources.append(source)
+        assert backend == detection.cv2.CAP_FFMPEG
+        assert dict(zip(params[::2], params[1::2])) == {
+            detection.cv2.CAP_PROP_OPEN_TIMEOUT_MSEC: 5000,
+            detection.cv2.CAP_PROP_READ_TIMEOUT_MSEC: 3000,
+        }
+        options = dict(item.split(";", 1) for item in
+                       os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"].split("|"))
+        assert options["rtsp_transport"] == "tcp"
+        assert options["fflags"] == "nobuffer"
+        assert options["flags"] == "low_delay"
+        assert options["threads"] == "1"
         return fake
     monkeypatch.setattr(detection.cv2, "VideoCapture", open_capture)
     url = "rtsp://user:password@192.0.2.1:554/stream"
@@ -52,9 +71,23 @@ def test_open_rtsp_passes_url_without_device_properties(monkeypatch):
 
 def test_failed_rtsp_releases_capture_and_omits_credentials(monkeypatch):
     fake = _FakeCap(opened=False)
-    monkeypatch.setattr(detection.cv2, "VideoCapture", lambda source: fake)
+    monkeypatch.setattr(detection.cv2, "VideoCapture", lambda *args: fake)
     with pytest.raises(SystemExit) as error:
         detection.open_camera({"rtsp_url": "rtsp://user:secret@192.0.2.1/stream"})
     assert "RTSP stream" in str(error.value)
     assert "secret" not in str(error.value)
     assert fake.released
+
+
+def test_rtsp_respects_explicit_ffmpeg_options(monkeypatch):
+    options = "rtsp_transport;udp|fflags;nobuffer|max_delay;0"
+    monkeypatch.setenv("OPENCV_FFMPEG_CAPTURE_OPTIONS", options)
+    fake = _FakeCap()
+
+    def open_capture(*args):
+        assert os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] == options
+        return fake
+
+    monkeypatch.setattr(detection.cv2, "VideoCapture", open_capture)
+    assert detection.open_camera({"rtsp_url": "rtsp://192.0.2.1/live"}) is fake
+    assert os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] == options

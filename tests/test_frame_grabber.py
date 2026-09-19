@@ -100,3 +100,38 @@ def test_grabber_get_new_times_out_when_no_progress():
         assert counter == latest
     finally:
         g.stop()
+
+
+def test_slow_consumer_receives_latest_frame_without_backlog():
+    drained = threading.Event()
+    resume = threading.Event()
+    frames = [_frame(1), _frame(2), _frame(3)]
+
+    class BurstCapture:
+        def __init__(self):
+            self.index = 0
+
+        def read(self):
+            if self.index < len(frames):
+                frame = frames[self.index]
+                self.index += 1
+                return True, frame
+            # Reaching the next read means all three frames were published.
+            drained.set()
+            resume.wait(timeout=2)
+            return False, None
+
+        def release(self):
+            pass
+
+    grabber = FrameGrabber(BurstCapture()).start()
+    try:
+        assert drained.wait(timeout=1)
+        frame, counter, misses = grabber.get_new(last_counter=0, timeout=0.1)
+        assert frame is frames[-1]
+        assert counter == 3
+        assert misses == 0
+    finally:
+        grabber._stop.set()
+        resume.set()
+        grabber.stop()
